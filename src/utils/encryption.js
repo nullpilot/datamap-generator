@@ -1,4 +1,3 @@
-import CryptoJS from "crypto-js";
 import { sha3_256 } from "js-sha3";
 import forge from "node-forge";
 // can't import iota from services/iota because the iota.lib.js tries to run
@@ -9,13 +8,9 @@ import _ from "lodash";
 // an eth private seed key is 64 characters, the treasure prefix is 20 characters,
 // and our tags are 32 characters
 const PAYLOAD_LENGTH = 64;
-const NONCE_LENGTH = 24;
-const TAG_LENGTH = 32;
-const TREASURE_PREFIX = _.split("Treasure: ", "")
-  .map(char => {
-    return char.charCodeAt(char).toString(16);
-  })
-  .join("");
+const IV_LENGTH = 16;
+const TAG_LENGTH = 16;
+const TREASURE_TRYTE_LENGTH = PAYLOAD_LENGTH * 2 + IV_LENGTH * 2 + TAG_LENGTH * 2;
 
 const parseEightCharsOfFilename = fileName => {
   fileName = fileName + getSalt(8);
@@ -41,38 +36,26 @@ export function getPrimordialHash() {
     .toHex();
 }
 
-const obfuscate = hash => forge.md.sha384.create().update(hash.toString()).digest().toHex();
+const obfuscate = hash => {
+  const byteStr = forge.util.hexToBytes(hash);
+  return forge.md.sha384
+    .create()
+    .update(byteStr)
+    .digest()
+    .toHex();
+} // Forge.util.binary.raw.decode(bytes)
 
-const sideChain = address => sha3_256(address).toString();
+const sideChain = address => sha3_256(address);
 
-const decryptTest = (text, secretKey) => {
-  //TODO temporary for debugging
-  try {
-    return CryptoJS.AES.decrypt(text, secretKey).toString();
-  } catch (e) {
-    return "";
-  }
-};
-
-const decryptTreasure = (
-  sideChainHash,
-  signatureMessageFragment,
-  sha256Hash
-) => {
-  const hexMessage = forge.util.bytesToHex(
-    iotaUtils.fromTrytes(
-      signatureMessageFragment.substring(
-        0,
-        PAYLOAD_LENGTH + TAG_LENGTH + TREASURE_PREFIX.length
-      )
-    )
+const decryptTreasure = (sideChainHash, signatureMessageFragment) => {
+  const key = sideChainHash
+  const secret = iotaUtils.fromTrytes(
+    signatureMessageFragment.substring(0, TREASURE_TRYTE_LENGTH)
   );
 
-  const decryptedValue = decrypt(sideChainHash, hexMessage, sha256Hash);
+  const treasure = decryptChunk(key, secret);
 
-  return _.startsWith(decryptedValue, TREASURE_PREFIX)
-    ? _.replace(decryptedValue, TREASURE_PREFIX, "")
-    : false;
+  return treasure.length === PAYLOAD_LENGTH ? treasure : false;
 };
 
 // Genesis hash is not yet obfuscated.
@@ -99,53 +82,54 @@ export function hashChain(byteStr) {
   return [obfuscatedHash, nextHash];
 }
 
-const encryptChunk = (key, secret) => {
+const encryptChunk = (key, idx, secret) => {
   key.read = 0;
-  const iv = forge.random.getBytesSync(16);
+  const iv = getNonce(key, idx);
   const cipher = forge.cipher.createCipher("AES-GCM", key);
 
   cipher.start({
     iv: iv,
-    tagLength: 0
+    tagLength: TAG_LENGTH * 8,
+    additionalData: "binary-encoded string"
   });
 
-  cipher.update(forge.util.createBuffer(CHUNK_PREFIX + secret));
+  cipher.update(forge.util.createBuffer(secret));
   cipher.finish();
 
-  return cipher.output.getBytes() + iv;
+  return cipher.output.bytes() + cipher.mode.tag.bytes() + iv;
 };
 
 const decryptChunk = (key, secret) => {
   key.read = 0;
+
+  // Require a payload of at least one byte to attempt decryption
+  if (secret.length <= IV_LENGTH + TAG_LENGTH) {
+    return "";
+  }
+
   const iv = secret.substr(-IV_LENGTH);
+  const tag = secret.substr(-TAG_LENGTH - IV_LENGTH, TAG_LENGTH);
   const decipher = forge.cipher.createDecipher("AES-GCM", key);
 
   decipher.start({
     iv: iv,
-    tagLength: 0,
-    output: null
+    tag: tag,
+    tagLength: TAG_LENGTH * 8,
+    additionalData: "binary-encoded string"
   });
 
   decipher.update(
-    forge.util.createBuffer(secret.substring(0, secret.length - IV_LENGTH))
+    forge.util.createBuffer(
+      secret.substring(0, secret.length - TAG_LENGTH - IV_LENGTH)
+    )
   );
 
+  // Most likely a treasure chunk, skip
   if (!decipher.finish()) {
-    let msg =
-      "decipher failed to finished in decryptChunk in utils/encryption.js";
-    Raven.captureException(new Error(msg));
     return "";
   }
 
-  const hexedOutput = forge.util.bytesToHex(decipher.output);
-
-  if (_.startsWith(hexedOutput, CHUNK_PREFIX_IN_HEX)) {
-    return forge.util.hexToBytes(
-      hexedOutput.substr(CHUNK_PREFIX_IN_HEX.length, hexedOutput.length)
-    );
-  } else {
-    return "";
-  }
+  return decipher.output.bytes();
 };
 
 
@@ -153,7 +137,6 @@ export default {
   hashChain,
   genesisHash,
   decryptChunk,
-  decryptTest, //TODO
   encryptChunk,
   getPrimordialHash,
   getSalt,
